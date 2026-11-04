@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+"""
+Wispbyte 自动开机/重启脚本（优化版）
+
+主要改动：
+  - 所有 API 请求改为在浏览器内 fetch（指纹/Cookie 一致，避免 requests 被 CF 返回 520）
+  - 每次操作前 ensure_connected，解决 UC 模式 chromedriver 断连（Errno 111）
+  - Cancel/Alert 之后不再强制刷新页面；没出现验证弹窗则再点一次 Start
+  - 验证通过后显式调用 Start API
+  - 修复 login 重试、关闭按钮误点、续期判断恒真、强制重启逻辑等
+  - 临时目录清理、单账号异常隔离、失败时退出码非 0
+  - 轮询节流改为基于时间戳（原 elapsed % N 写法几乎不触发）
+  - Turnstile 判定限定在验证弹窗内，避免残留 token 误判
+  - 有资格但 Start API 失败、浏览器验证也未通过时不再空等轮询
+  - 服务器 ID 兜底提取增加格式校验；WARP 重注册失败时尝试原样重连
+  - 运行时长优先走接口获取，页面读取延长等待并刷新重试；WARP 换 IP 校验新旧 IP 并重试
+  - TG 推送合并为整次运行一条：汇总 + 每账号出口 IP + 每台服务器结果 + 截图相册
+"""
+
+import os
+import re
+import sys
+import time
+import json
+import shutil
+import logging
+import tempfile
+import subprocess
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import List, Tuple, Optional
+
+import requests
+from seleniumbase import SB
+
+# ====================== 配置 ======================
+LOGIN_URL = "https://wispbyte.com/client"
+CONSOLE_URL_TEMPLATE = "https://wispbyte.com/client/servers/{identifier}/console"
+
+API_STATUS_PATH = "/client/api/servers/status"
+API_CAPTCHA_STATUS_PATH = "/client/api/server/start-captcha/status"
+API_CAPTCHA_REWARDED_PATH = "/client/api/server/start-captcha/rewarded"
+API_SERVER_START_PATH = "/client/api/server/start"
+
+WORKSPACE = os.environ.get("GITHUB_WORKSPACE", str(Path.cwd()))
+OUTPUT_DIR = Path(WORKSPACE) / "output/screenshots"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+SERVER_ID_RE = re.compile(r"[0-9a-fA-F]{8}")
+
+START_BTN_JS = "var b=document.querySelector('#start-btn,#restart-btn');if(b){b.click();return true;}return false;"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("wispbyte_restart")
+for _noisy in ("seleniumbase", "selenium", "urllib3", "undetected_chromedriver"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
+
+# ====================== 工具函数 ======================
+def mask_email(email: str) -> str:
+    if "@" not in email:
+        if len(email) <= 2:
+            return (email[0] + "***") if email else "***"
+        return email[0] + "***" + email[-1]
+    local, domain = email.split("@", 1)
+    if not local:
+        m = "***"
+    elif len(local) == 1:
+        m = local + "***"
+    else:
+        m = local[0] + "***" + local[-1]
+    return f"{m}@{domain}"
+
+
+def mask_server_id(identifier: str) -> str:
+    if not identifier or len(identifier) <= 4:
+        return "***"
+    return identifier[:2] + "***" + identifier[-2:]
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}天{h}小时{m}分"
+    if h:
+        return f"{h}小时{m}分"
+    return f"{m}分{sec}秒" if m else f"{sec}秒"
+
+
+class Throttle:
+    """按时间间隔节流：ready() 距上次触发超过 interval 秒时返回 True。"""
+
+    def __init__(self, interval: float, fire_first: bool = True):
+        self.interval = interval
+        self.last = 0.0 if fire_first else time.time()
+
+    def ready(self) -> bool:
+        now = time.time()
+        if now - self.last >= self.interval:
+            self.last = now
+            return True
+        return False
+
+
+def log(msg: str, level: str = "INFO"):
+    lv = {"INFO": logging.INFO, "WARN": logging.WARNING, "ERROR": logging.ERROR}.get(level, logging.INFO)
+    logger.log(lv, f"[{level}] {msg}")
+
+
+def _warp(*args, timeout: int = 30):
+    return subprocess.run(["sudo", "warp-cli", "--accept-tos", *args], timeout=timeout, capture_output=True)
+
+
+USED_IPS: set = set()  # 本次运行中已被账号用过的出口 IP
+
+
+def restart_warp(max_tries: int = 3) -> bool:
+    """重新注册 WARP 以更换出口 IP；新 IP 与当前 IP 或已用过的 IP 重复则重试，最多 max_tries 次。"""
+    log("正在重启 WARP 以更换 IP...")
+    old_ip = get_exit_ip()
+    log(f"当前 IP: {old_ip}，本次已用 IP: {sorted(USED_IPS)}")
+    avoid = USED_IPS | {old_ip}
+    new_ip = old_ip
+    for attempt in range(1, max_tries + 1):
+        try:
+            _warp("disconnect")
+            time.sleep(3)
+            if _warp("registration", "delete").returncode != 0:
+                log("删除注册失败（可能未注册），继续...", "WARN")
+            if _warp("registration", "new").returncode != 0:
+                raise RuntimeError("registration new 失败")
+            time.sleep(3)
+            if _warp("connect").returncode != 0:
+                raise RuntimeError("connect 失败")
+            time.sleep(10)
+            new_ip = get_exit_ip()
+            if new_ip != "未知" and new_ip not in avoid:
+                log(f"✅ WARP 已更换 IP: {old_ip} → {new_ip}（第 {attempt} 次）")
+                return True
+            log(f"第 {attempt}/{max_tries} 次重注册后 IP 重复（{new_ip}），重试...", "WARN")
+        except Exception as e:
+            log(f"第 {attempt}/{max_tries} 次 WARP 重连失败: {e}", "ERROR")
+            try:
+                _warp("connect")
+                time.sleep(8)
+            except Exception:
+                pass
+    if get_exit_ip() == "未知":
+        log("WARP 兜底后仍无网络，后续请求可能失败", "ERROR")
+        return False
+    log(f"⚠️ {max_tries} 次重注册后 IP 仍重复（{new_ip}）（WARP 出口 IP 池共享，同机房常见），继续执行", "WARN")
+    return False
+
+
+def ensure_connected(sb):
+    """UC 模式下 chromedriver 可能被主动断开，操作前先确认/重连。"""
+    try:
+        _ = sb.driver.title
+        return
+    except Exception:
+        pass
+    for fn, args in (("connect", ()), ("reconnect", (2,))):
+        try:
+            getattr(sb.driver, fn)(*args)
+            _ = sb.driver.title
+            return
+        except Exception:
+            continue
+
+
+def safe_url(sb) -> str:
+    ensure_connected(sb)
+    try:
+        return sb.get_current_url() or ""
+    except Exception:
+        return ""
+
+
+def take_screenshot(sb, account_index: int, suffix: str) -> str:
+    filename = f"acc{account_index}-{suffix}-{datetime.now().strftime('%H%M%S')}.png"
+    filepath = str(OUTPUT_DIR / filename)
+    try:
+        ensure_connected(sb)
+        sb.save_screenshot(filepath)
+        log(f"📸 截图保存: {filepath}")
+        return filepath
+    except Exception as e:
+        log(f"截图失败: {e}", "WARN")
+        return ""
+
+
+def block_ads_modals(sb):
+    css = ".wisp-offer-modal, .instagram-modal, .qc-cmp2-summary-section { display: none !important; }"
+    try:
+        ensure_connected(sb)
+        sb.execute_script(
+            "var s=document.createElement('style');s.textContent=%s;document.head.appendChild(s);"
+            % json.dumps(css)
+        )
+        log("✅ 已注入广告屏蔽 CSS")
+    except Exception as e:
+        log(f"注入屏蔽 CSS 失败: {e}", "WARN")
+
+
+# ====================== 浏览器内 fetch（核心）======================
+def browser_fetch(sb, method: str, path: str, body=None, timeout: int = 30) -> Tuple[int, dict, str]:
+    """在页面上下文里发请求，指纹与 Cookie 与浏览器完全一致。返回 (status, json, text预览)。"""
+    ensure_connected(sb)
+    body_js = json.dumps(json.dumps(body)) if body is not None else "null"
+    js = f"""
+    var cb = arguments[arguments.length - 1];
+    var opt = {{method: {json.dumps(method)}, credentials: 'include',
+               headers: {{'Accept': 'application/json',
+                          'X-Requested-With': 'XMLHttpRequest',
+                          'Content-Type': 'application/json'}}}};
+    var b = {body_js};
+    if (b) opt.body = b;
+    fetch({json.dumps(path)}, opt)
+      .then(function(r) {{ return r.text().then(function(t) {{ cb({{status: r.status, text: t}}); }}); }})
+      .catch(function(e) {{ cb({{status: 0, text: String(e)}}); }});
+    """
+    try:
+        sb.driver.set_script_timeout(timeout)
+        res = sb.driver.execute_async_script(js) or {}
+    except Exception as e:
+        return 0, {}, str(e)[:200]
+    text = res.get("text", "") or ""
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    preview = "(HTML 页面)" if text.lstrip()[:15].lower().startswith(("<!doctype", "<html")) else text[:200]
+    return int(res.get("status", 0) or 0), data, preview
+
+
+def api_get_captcha_status(sb) -> dict:
+    st, data, prev = browser_fetch(sb, "GET", API_CAPTCHA_STATUS_PATH)
+    if st != 200:
+        log(f"captcha status HTTP {st}: {prev}", "WARN")
+        return {}
+    return data
+
+
+def api_refresh_rewarded(sb) -> bool:
+    st, data, prev = browser_fetch(sb, "POST", API_CAPTCHA_REWARDED_PATH, {})
+    log(f"rewarded: {st} {prev[:80]}")
+    return st == 200 and data.get("success") is not False
+
+
+def api_start_server(sb, identifier: str) -> Tuple[bool, str]:
+    st, data, prev = browser_fetch(sb, "POST", API_SERVER_START_PATH, {"serverId": identifier})
+    log(f"Start API: {st} {prev[:120]}")
+    ok = st == 200 and data.get("success") is not False
+    return ok, f"{st} {prev}"
+
+
+def ensure_start_gate(sb) -> bool:
+    """确保具备启动资格：status 有效 → 直接通过；否则尝试 rewarded 续期并复查。"""
+    status = api_get_captcha_status(sb)
+    if status.get("valid"):
+        log(f"✅ 启动资格有效（到期: {status.get('expiresAt') or status.get('expires') or '?'}），跳过广告")
+        return True
+    log("启动资格无效或未知，尝试 rewarded 续期...")
+    if api_refresh_rewarded(sb) and api_get_captcha_status(sb).get("valid"):
+        log("✅ rewarded 续期成功")
+        return True
+    log("rewarded 未能获得资格，需浏览器验证流程", "WARN")
+    return False
+
+
+def get_servers(sb) -> List[str]:
+    log("请求服务器列表...")
+    st, data, prev = browser_fetch(sb, "GET", API_STATUS_PATH)
+    ids = [str(s.get("identifier")) for s in (data.get("servers") or []) if s.get("identifier")]
+    if ids:
+        log(f"成功获取服务器列表，共 {len(ids)} 台: {[mask_server_id(i) for i in ids]}")
+        return ids
+    log(f"API 未返回服务器 ({st} {prev[:60]})，尝试 DOM 提取", "WARN")
+    try:
+        dom_ids = sb.execute_script("""
+            return Array.from(document.querySelectorAll('[data-server-id], .server-card, .server-item'))
+              .map(function(el){return el.getAttribute('data-server-id') || el.id;}).filter(Boolean);
+        """)
+        dom_ids = [i for i in dict.fromkeys(dom_ids or []) if SERVER_ID_RE.fullmatch(str(i))]
+        if dom_ids:
+            log(f"从 DOM 提取到 {len(dom_ids)} 台服务器")
+            return dom_ids
+    except Exception as e:
+        log(f"DOM 提取失败: {e}", "WARN")
+    log("未能获取任何服务器标识符", "ERROR")
+    return []
+
+
+def get_server_info(sb, identifier: str) -> dict:
+    st, data, _ = browser_fetch(sb, "GET", API_STATUS_PATH)
+    for srv in data.get("servers") or []:
+        if srv.get("identifier") == identifier:
+            return srv
+    return {}
+
+
+def get_server_status(sb, identifier: str) -> Optional[str]:
+    val = get_server_info(sb, identifier).get("current_state")
+    return str(val).strip() if val else None
+
+
+def _flatten(obj, prefix=""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _flatten(v, f"{prefix}.{k}" if prefix else str(k))
+    else:
+        yield prefix, obj
+
+
+def parse_duration_text(text: str) -> Optional[float]:
+    """严格解析 '2d 3h 4m 5s' / '1m 10s'：整段文本必须只由「数字+单位」组成。"""
+    t = (text or "").strip().lower()
+    if not re.fullmatch(r"(?:\d+\s*[dhms]\s*)+", t):
+        return None
+    unit = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    sec = float(sum(int(n) * unit[u] for n, u in re.findall(r"(\d+)\s*([dhms])", t)))
+    return sec if sec <= 400 * 86400 else None  # 超过 400 天视为异常
+
+
+SCRAPE_UPTIME_JS = r"""
+var out = [];
+var els = document.querySelectorAll('*');
+for (var i = 0; i < els.length; i++) {
+  var el = els[i];
+  if (el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'uptime') {
+    var row = el.parentElement;
+    for (var d = 0; d < 3 && row; d++, row = row.parentElement) {
+      var t = (row.innerText || '').replace(/uptime/ig, '').trim();
+      if (t) out.push(t.slice(0, 60));
+    }
+  }
+}
+var body = (document.body && document.body.innerText) || '';
+var m = body.match(/online\s*[\u2022\u00b7|-]?\s*((?:\d+\s*[dhms]\s*)+)/i);
+return {cands: out, header: m ? m[1] : ''};
+"""
+
+
+def _uptime_from_obj(obj: dict) -> Optional[float]:
+    """从接口返回里找运行时长：uptime 类字段（秒/毫秒/文本）或启动时间戳。"""
+    for key, val in _flatten(obj):
+        k = key.lower()
+        if val in (None, "", 0):
+            continue
+        if "uptime" in k:
+            if isinstance(val, (int, float)) or (isinstance(val, str) and re.fullmatch(r"\d+(\.\d+)?", val)):
+                v = float(val)
+                # 带 ms 后缀，或数值超过 400 天秒数 → 视为毫秒（Pterodactyl resources.uptime 即毫秒）
+                if k.endswith("ms") or "milli" in k or v > 400 * 86400:
+                    v /= 1000.0
+                if 0 < v <= 400 * 86400:
+                    return v
+            elif isinstance(val, str):
+                sec = parse_duration_text(val)
+                if sec is not None:
+                    return sec
+        if any(t in k for t in ("started_at", "startedat", "start_time", "starttime", "last_start")):
+            try:
+                ts = float(val) if not isinstance(val, str) or val.replace(".", "", 1).isdigit() else \
+                    datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+                if ts > 1e12:
+                    ts /= 1000.0
+                diff = time.time() - ts
+                if 0 < diff <= 400 * 86400:
+                    return diff
+            except Exception:
+                continue
+    return None
+
+
+UPTIME_API_CANDIDATES = (
+    "/client/api/servers/{id}/resources",
+    "/client/api/server/{id}/resources",
+    "/client/api/servers/{id}/stats",
+)
+
+
+def api_uptime_seconds(sb, identifier: str) -> Optional[float]:
+    """优先用接口拿运行时长：先看状态接口，再试几个常见的 resources 接口。"""
+    sec = _uptime_from_obj(get_server_info(sb, identifier))
+    if sec is not None:
+        log("运行时长来源: 状态接口")
+        return sec
+    for tpl in UPTIME_API_CANDIDATES:
+        path = tpl.format(id=identifier)
+        st, data, _ = browser_fetch(sb, "GET", path, timeout=15)
+        if st == 200 and data:
+            sec = _uptime_from_obj(data)
+            if sec is not None:
+                log(f"运行时长来源: {path}")
+                return sec
+            log(f"{path} 返回字段中无运行时长: {sorted(k for k, _ in _flatten(data))[:30]}")
+    return None
+
+
+def get_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[float]:
+    """接口优先，拿不到再读页面（页面需等控制台连上服务器才显示，读不到会刷新重试一次）。"""
+    sec = api_uptime_seconds(sb, identifier)
+    if sec is not None:
+        return sec
+    sec = scrape_uptime_seconds(sb, identifier, console_url, rounds=20)
+    if sec is not None:
+        return sec
+    log("页面首次未读到运行时长，刷新控制台后重试...")
+    try:
+        ensure_connected(sb)
+        sb.get(console_url)
+        time.sleep(5)
+        block_ads_modals(sb)
+    except Exception as e:
+        log(f"刷新控制台失败: {e}", "WARN")
+    return scrape_uptime_seconds(sb, identifier, console_url, rounds=20)
+
+
+def scrape_uptime_seconds(sb, identifier: str, console_url: str, rounds: int = 14) -> Optional[float]:
+    """从控制台页面读取运行时长：优先 Server info 的 Uptime，其次顶部 'Online • 时长'。"""
+    last = {}
+    try:
+        ensure_connected(sb)
+        if f"/servers/{identifier}/console" not in safe_url(sb):
+            sb.get(console_url)
+            time.sleep(3)
+        for _ in range(rounds):
+            last = sb.execute_script(SCRAPE_UPTIME_JS) or {}
+            for cand in last.get("cands", []):
+                for line in cand.splitlines():
+                    sec = parse_duration_text(line)
+                    if sec is not None:
+                        log(f"运行时长来源: Uptime 项，原文 '{line.strip()}'")
+                        return sec
+            sec = parse_duration_text(last.get("header", ""))
+            if sec is not None:
+                log(f"运行时长来源: 顶部 Online，原文 '{last.get('header', '').strip()}'")
+                return sec
+            time.sleep(1.5)
+    except Exception as e:
+        log(f"读取页面 Uptime 失败: {e}", "WARN")
+    log(f"页面未读到运行时长，候选文本: {last}", "WARN")
+    return None
+
+
+def is_server_running(status: Optional[str]) -> bool:
+    return bool(status) and "running" in status.lower()
+
+
+def status_to_chinese(status: Optional[str]) -> str:
+    if not status:
+        return "未知"
+    s = status.lower().strip()
+    mapping = {"running": "运行中", "offline": "离线", "stopped": "已停止", "starting": "启动中",
+               "stopping": "停止中", "installing": "安装中", "suspended": "已暂停", "unknown": "未知"}
+    for k, cn in mapping.items():
+        if k in s:
+            return cn
+    return status
+
+
+# ====================== Turnstile ======================
+def check_turnstile_solved(sb, scope: Optional[str] = None) -> bool:
+    """scope 为 CSS 选择器时只在该容器内判断（例如重启验证弹窗），避免页面上残留 token 误判。"""
+    try:
+        ensure_connected(sb)
+        return bool(sb.execute_script("""
+            var sel = arguments[0];
+            var root = sel ? document.querySelector(sel) : document;
+            if (!root) return false;
+            var inp = root.querySelector('input[name="cf-turnstile-response"]');
+            if (inp && inp.value && inp.value.length > 20) return true;
+            var iframe = root.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (iframe && iframe.getAttribute("data-state") === "solved") return true;
+            if (sel) return false;
+            var success = document.getElementById('success');
+            return !!(success && getComputedStyle(success).display !== 'none');
+        """, scope))
+    except Exception:
+        return False
+
+
+def _click_captcha(sb) -> bool:
+    try:
+        sb.uc_gui_click_captcha()
+        return True
+    except Exception as e:
+        log(f"点击 Turnstile 异常: {e}", "WARN")
+        return False
+    finally:
+        ensure_connected(sb)
+
+
+def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
+    log("等待 Turnstile 验证...")
+    start, last_click = time.time(), 0.0
+    while time.time() - start < timeout:
+        if check_turnstile_solved(sb):
+            log("✅ Turnstile 验证成功")
+            return True
+        if time.time() - last_click > 3:
+            _click_captcha(sb)
+            last_click = time.time()
+            log("点击 Turnstile")
+        time.sleep(1)
+    log("⏰ Turnstile 验证超时", "WARN")
+    return False
+
+
+MODAL_SELECTOR = ".wisp-start-captcha-modal"
+
+MODAL_VISIBLE_JS = """
+    var el = document.querySelector('.wisp-start-captcha-modal');
+    return !!(el && getComputedStyle(el).display !== 'none');
+"""
+
+
+def _modal_visible(sb) -> bool:
+    try:
+        ensure_connected(sb)
+        return bool(sb.execute_script(MODAL_VISIBLE_JS))
+    except Exception:
+        return False
+
+
+def handle_restart_turnstile_modal(sb, timeout: int = 90, wait_modal: int = 20) -> bool:
+    """
+    处理点击 Start 后的 CF Turnstile 弹窗（.wisp-start-captcha-modal）。
+    弹窗从未出现 → 返回 False（由调用方决定是否重试），不再误报成功。
+    """
+    log("等待 CF Turnstile 重启验证弹窗...")
+    appeared = False
+    for _ in range(wait_modal):
+        if _modal_visible(sb):
+            appeared = True
+            log("CF Turnstile 弹窗已出现")
+            break
+        time.sleep(1)
+    if not appeared:
+        log("CF Turnstile 弹窗未出现", "WARN")
+        return False
+
+    start, last_click = time.time(), 0.0
+    while time.time() - start < timeout:
+        if not _modal_visible(sb):
+            log("✅ CF Turnstile 弹窗已关闭，验证完成")
+            return True
+        if check_turnstile_solved(sb, MODAL_SELECTOR):
+            log("Turnstile 已解决，等待弹窗自动关闭...")
+            for _ in range(15):
+                if not _modal_visible(sb):
+                    log("✅ 弹窗已自动关闭")
+                    return True
+                time.sleep(1)
+            return True  # 已解决视为成功，不去点 cancel 之类的按钮
+        if time.time() - last_click > 3:
+            if _click_captcha(sb):
+                log("CF弹窗内点击 Turnstile (uc_gui)")
+            last_click = time.time()
+        time.sleep(1)
+
+    if not _modal_visible(sb) or check_turnstile_solved(sb, MODAL_SELECTOR):
+        log("✅ 超时后验证已完成")
+        return True
+    log("CF Turnstile 弹窗处理超时", "WARN")
+    return False
+
+
+# ====================== 广告页面处理 ======================
+def _dismiss_alert_if_present(sb) -> bool:
+    try:
+        alert = sb.driver.switch_to.alert
+        log(f"发现 Alert 弹窗: {alert.text[:100]}")
+        alert.accept()
+        log("✅ Alert 弹窗已关闭（点击确定）")
+        time.sleep(1)
+        return True
+    except Exception:
+        return False
+
+
+def _handle_adblocker_page(sb) -> bool:
+    log("检测到广告拦截器页面，尝试点击 'Check again'...")
+    try:
+        sb.execute_script("var b=document.getElementById('recheck-btn'); if(b) b.click();")
+        time.sleep(3)
+        return True
+    except Exception as e:
+        log(f"点击 'Check again' 失败: {e}", "WARN")
+        return False
+
+
+def _get_page_situation(sb) -> str:
+    url = safe_url(sb)
+    if not url:
+        return "unknown"
+    if "reward-video" in url or "reward_video" in url:
+        return "reward"
+    try:
+        if sb.execute_script("""
+            var box = document.querySelector('.check-box');
+            var title = document.querySelector('.check-title');
+            return !!(box || (title && title.textContent.toLowerCase().includes('adblocker')));
+        """):
+            return "adblocker"
+        if sb.execute_script("return !!(document.getElementById('embedWatchBtn') || document.getElementById('embedPlayBtn'));"):
+            return "reward"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _try_close_ad_overlay(sb) -> bool:
+    """点击广告层的关闭/跳过按钮。长词子串匹配，单字符符号必须全等，且只点按钮类元素。"""
+    try:
+        ensure_connected(sb)
+        clicked = sb.execute_script("""
+            var words = ['close', 'skip', 'cancel', '关闭', '跳过', '取消'];
+            var symbols = ['×', '✕', 'x'];
+            var els = document.querySelectorAll('button, div[role="button"], span[role="button"], [aria-label*="lose"], [aria-label*="kip"]');
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!el || el.offsetParent === null) continue;
+                var own = (el.innerText || el.textContent || '').trim().toLowerCase();
+                var meta = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+                if (symbols.indexOf(own) !== -1) { try { el.click(); return true; } catch(e) {} }
+                var all = own + ' ' + meta;
+                for (var k = 0; k < words.length; k++) {
+                    if (all.indexOf(words[k]) !== -1) { try { el.click(); return true; } catch(e) {} }
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            log("✅ 已点击广告关闭/取消按钮")
+            time.sleep(2)
+            return True
+    except Exception as e:
+        log(f"查找关闭按钮异常: {e}", "WARN")
+    return False
+
+
+def _click_venatus_cancel(sb) -> bool:
+    try:
+        ensure_connected(sb)
+        clicked = sb.execute_script("""
+            var buttons = document.querySelectorAll('button, a, [role="button"]');
+            for (var i = 0; i < buttons.length; i++) {
+                var t = (buttons[i].innerText || buttons[i].textContent || '').trim().toLowerCase();
+                if (t === 'cancel' || t === '取消') { buttons[i].click(); return true; }
+            }
+            for (var j = 0; j < buttons.length; j++) {
+                var r = buttons[j].getBoundingClientRect();
+                var t2 = (buttons[j].innerText || buttons[j].textContent || '').trim().toLowerCase();
+                if (r.top < 80 && r.right > (window.innerWidth - 120) &&
+                    (t2.indexOf('cancel') !== -1 || t2.indexOf('close') !== -1 || t2 === '×')) {
+                    buttons[j].click(); return true;
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            time.sleep(1)
+            return True
+    except Exception as e:
+        log(f"点击 Cancel 异常: {e}", "WARN")
+    return False
+
+
+def _wait_for_reward_btn_ready(sb, timeout: int = 60) -> bool:
+    log(f"等待广告视频加载就绪（最长 {timeout}s）...")
+    start = time.time()
+    log_t = Throttle(10)
+    while time.time() - start < timeout:
+        elapsed = int(time.time() - start)
+        try:
+            ensure_connected(sb)
+            r = sb.execute_script("""
+                var btn = document.getElementById('embedWatchBtn');
+                var panel = document.getElementById('embedPlayBtn');
+                var status = document.getElementById('embedStatus');
+                if (!btn || !panel) return {ready: false, reason: 'no_element'};
+                if (getComputedStyle(panel).display === 'none')
+                    return {ready: false, reason: 'panel_hidden', statusText: status ? status.textContent : ''};
+                var cs = getComputedStyle(btn);
+                return {ready: cs.display !== 'none' && cs.visibility !== 'hidden', reason: 'ok'};
+            """)
+            if r and r.get("ready"):
+                log("✅ 广告已就绪，Watch ad 按钮可点击")
+                return True
+            if log_t.ready():
+                log(f"广告加载中... [{elapsed}s] reason={(r or {}).get('reason')}")
+        except Exception as e:
+            log(f"检查广告就绪状态异常: {e}", "WARN")
+        time.sleep(2)
+    log(f"⏰ 广告按钮等待超时 ({timeout}s)", "WARN")
+    return False
+
+
+def _click_watch_ad_btn(sb) -> bool:
+    log("点击 'Watch ad to continue' 按钮...")
+    methods = [
+        lambda: sb.execute_script("var b=document.getElementById('embedWatchBtn'); if(!b) return false; b.click(); return true;"),
+        lambda: (sb.click("#embedWatchBtn") or True),
+        lambda: sb.execute_script("var b=document.getElementById('embedWatchBtn'); if(!b) return false; "
+                                  "b.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true})); return true;"),
+    ]
+    for i, m in enumerate(methods, 1):
+        try:
+            if m():
+                log(f"✅ 广告按钮点击成功（方式{i}）")
+                time.sleep(1)
+                return True
+        except Exception as e:
+            log(f"广告按钮点击方式{i}失败: {e}", "WARN")
+    log("所有广告按钮点击方式均失败", "ERROR")
+    return False
+
+
+def _wait_for_ad_completion(sb, identifier: str, timeout: int = 180) -> bool:
+    safe_id = mask_server_id(identifier)
+    log(f"广告开始播放，等待完成（最长 {timeout}s）: {safe_id}")
+    start = time.time()
+    console_path = f"/servers/{identifier}/console"
+    time.sleep(5)
+    _try_close_ad_overlay(sb)
+    close_t, mid_log_t, log_t = Throttle(8, False), Throttle(15), Throttle(15)
+    while time.time() - start < timeout:
+        elapsed = int(time.time() - start)
+        try:
+            url = safe_url(sb)
+            if "rewardDone=1" in url or console_path in url:
+                log(f"✅ 广告完成: {safe_id}")
+                return True
+            # 只在广告页内才尝试点关闭，避免回到控制台后误点其它 Cancel
+            if elapsed < 60 and close_t.ready():
+                _try_close_ad_overlay(sb)
+            if any(k in url for k in ("venatus", "reward-demo", "reward_demo")):
+                if mid_log_t.ready():
+                    log(f"仍在广告中间页 [{elapsed}s]")
+                time.sleep(3)
+                continue
+            try:
+                st = sb.execute_script("""
+                    var st = document.getElementById('embedStatus');
+                    if (!st) return {visible: false, text: ''};
+                    return {visible: getComputedStyle(st).display !== 'none', text: st.textContent || ''};
+                """)
+                if st and st.get("visible"):
+                    text = st.get("text", "").lower()
+                    if any(kw in text for kw in ("starting", "saving", "returning", "session")):
+                        log(f"✅ 广告完成 [embedStatus='{text[:50]}']: {safe_id}")
+                        time.sleep(5)
+                        return True
+            except Exception:
+                pass
+            if log_t.ready():
+                log(f"等待广告完成... [{elapsed}s]")
+        except Exception as e:
+            log(f"广告完成检测异常: {e}", "WARN")
+        time.sleep(3)
+    log(f"广告等待超时 ({timeout}s): {safe_id}", "WARN")
+    return False
+
+
+def _execute_reward_ad_watch(sb, identifier: str) -> bool:
+    log(f"进入广告观看流程: {mask_server_id(identifier)}")
+    if not _wait_for_reward_btn_ready(sb, timeout=60):
+        if _dismiss_alert_if_present(sb):
+            return True
+        url = safe_url(sb)
+        if "reward-video" not in url and "venatus" not in url:
+            return True
+        if _click_venatus_cancel(sb):
+            time.sleep(2)
+            _dismiss_alert_if_present(sb)
+        return True
+    if _dismiss_alert_if_present(sb):
+        return True
+    if not _click_watch_ad_btn(sb):
+        _click_venatus_cancel(sb)
+        _dismiss_alert_if_present(sb)
+        return True
+    _wait_for_ad_completion(sb, identifier, timeout=180)
+    _dismiss_alert_if_present(sb)
+    return True
+
+
+def handle_reward_ad_flow(sb, identifier: str) -> bool:
+    """
+    点击 Start 后的前置流程：
+      venatus 广告页 → Cancel → Alert「No ad available...」→ 确定 → CF 验证
+      或出现完整广告观看页。
+    """
+    log(f"广告流程处理开始: {mask_server_id(identifier)}")
+    console_path = f"/servers/{identifier}/console"
+    ad_keys = ("venatus", "reward-demo", "reward_demo", "reward-video", "reward")
+
+    navigated_away = False
+    for _ in range(8):
+        if _dismiss_alert_if_present(sb):
+            return True
+        url = safe_url(sb)
+        if any(k in url for k in ad_keys):
+            navigated_away = True
+            log(f"已跳转到广告页: {url[:70]}")
+            break
+        time.sleep(1)
+
+    start, max_wait, cancel_clicked = time.time(), 40, False
+    wait_log_t = Throttle(5)
+    while time.time() - start < max_wait:
+        elapsed = int(time.time() - start)
+        if _dismiss_alert_if_present(sb):
+            return True
+        url = safe_url(sb)
+
+        if any(k in url for k in ad_keys):
+            if not cancel_clicked:
+                if _click_venatus_cancel(sb):
+                    cancel_clicked = True
+                    log("✅ 已点击 Cancel，等待页面响应...")
+                    time.sleep(3)
+                    if _dismiss_alert_if_present(sb):
+                        return True
+                else:
+                    _try_close_ad_overlay(sb)
+                    time.sleep(2)
+            elif wait_log_t.ready():
+                log(f"已点 Cancel，等待 Alert 或跳转... [{elapsed}s]")
+            time.sleep(1)
+            continue
+
+        if console_path in url:
+            if navigated_away or cancel_clicked or elapsed > 5:
+                log("已回到控制台页面，结束广告流程")
+                time.sleep(1)
+                _dismiss_alert_if_present(sb)
+                return True
+            time.sleep(1)
+            continue
+
+        situation = _get_page_situation(sb)
+        if situation == "adblocker":
+            _handle_adblocker_page(sb)
+            time.sleep(2)
+            continue
+        if situation == "reward":
+            return _execute_reward_ad_watch(sb, identifier)
+        time.sleep(1)
+
+    _dismiss_alert_if_present(sb)
+    log("广告流程等待超时，继续执行验证", "WARN")
+    return True
+
+
+# ====================== 登录 ======================
+def _is_error_page(sb) -> bool:
+    try:
+        ensure_connected(sb)
+        title = (sb.get_title() or "").lower()
+        body = (sb.execute_script("return (document.body && document.body.innerText) || '';") or "").lower()
+        if any(kw in title for kw in ("500 ", "502 ", "503 ", "520 ", "internal server error", "bad gateway")):
+            return True
+        if any(kw in body[:600] for kw in ("500 internal server error", "502 bad gateway", "503 service",
+                                           "error 520", "error 522", "error 524", "web server is returning an unknown error")):
+            return True
+        if len(body.strip()) < 30 and not sb.is_element_present("input#email"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def login(sb, email: str, password: str) -> bool:
+    max_attempts = 4
+    form_ok = False
+    for attempt in range(1, max_attempts + 1):
+        log(f"访问登录页（第 {attempt}/{max_attempts} 次）...")
+        try:
+            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=12)
+        except Exception as e:
+            log(f"打开登录页异常: {e}", "WARN")
+        ensure_connected(sb)
+        time.sleep(3 + attempt)
+
+        if _is_error_page(sb):
+            log(f"检测到错误页/空白页（第 {attempt} 次）", "WARN")
+        else:
+            try:
+                sb.wait_for_element_visible("input#email", timeout=18)
+                log("✅ 找到登录表单")
+                form_ok = True
+                break
+            except Exception:
+                log(f"未找到登录表单（第 {attempt} 次）", "WARN")
+
+        if attempt < max_attempts:
+            restart_warp(max_tries=1)
+            time.sleep(4)
+
+    if not form_ok:
+        log("多次重试后仍无法加载登录页", "ERROR")
+        return False
+
+    log("填写登录信息...")
+    try:
+        sb.type("input#email", email)
+        time.sleep(0.6)
+        sb.type("input#password", password)
+        time.sleep(0.6)
+    except Exception as e:
+        log(f"填写登录信息失败: {e}", "ERROR")
+        return False
+
+    if not wait_for_turnstile_success(sb, timeout=40):
+        log("登录 Turnstile 未通过", "ERROR")
+        return False
+
+    log("提交登录...")
+    try:
+        sb.click("button.login-btn")
+    except Exception:
+        try:
+            sb.execute_script('document.querySelector("form#login-form").submit()')
+        except Exception as e:
+            log(f"提交登录失败: {e}", "ERROR")
+            return False
+
+    log("等待跳转到仪表盘...")
+    for _ in range(25):
+        if "/dashboard" in safe_url(sb):
+            log("已跳转到仪表盘")
+            break
+        if _is_error_page(sb):
+            log("跳转过程中出现错误页", "ERROR")
+            return False
+        time.sleep(1)
+    else:
+        log("登录后未成功跳转到仪表盘", "ERROR")
+        return False
+
+    block_ads_modals(sb)
+    log("✅ 登录成功并进入仪表盘")
+    return True
+
+
+# ====================== 浏览器验证流程 ======================
+def browser_verify_flow(sb, identifier: str, console_url: str) -> bool:
+    """
+    点 Start → 广告/Cancel/Alert → 等回控制台（不强制刷新）→ Turnstile 弹窗。
+    弹窗没出现则再点一次 Start 重试。返回是否通过验证。
+    """
+    ensure_connected(sb)
+    try:
+        if not sb.execute_script(START_BTN_JS):
+            log("未找到 Start/Restart 按钮", "WARN")
+            return False
+    except Exception as e:
+        log(f"点击 Start 失败: {e}", "WARN")
+        return False
+    log("已点击 Start/Restart，进入广告流程")
+    time.sleep(2)
+
+    handle_reward_ad_flow(sb, identifier)
+
+    console_path = f"/servers/{identifier}/console"
+    for _ in range(10):  # 等页面自己跳回控制台
+        if console_path in safe_url(sb):
+            break
+        time.sleep(1)
+    else:
+        sb.get(console_url)
+        time.sleep(3)
+
+    _dismiss_alert_if_present(sb)
+    block_ads_modals(sb)
+
+    passed = handle_restart_turnstile_modal(sb, timeout=60, wait_modal=12)
+    if not passed:
+        log("未见验证弹窗，再点一次 Start 触发验证...")
+        try:
+            sb.execute_script(START_BTN_JS)
+        except Exception:
+            pass
+        time.sleep(2)
+        _dismiss_alert_if_present(sb)
+        passed = handle_restart_turnstile_modal(sb, timeout=60, wait_modal=15)
+    return passed
+
+
+# ====================== 开机 ======================
+def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
+    """仅在需要时开机：状态 running → 跳过；离线/异常 → 走资格校验 + Start。"""
+    console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
+    safe_id = mask_server_id(identifier)
+    log("─" * 40)
+    log(f"处理服务器: {safe_id}")
+    log("─" * 40)
+
+    ensure_connected(sb)
+    sb.get(console_url)
+    time.sleep(3)
+    block_ads_modals(sb)
+
+    info = get_server_info(sb, identifier)
+    current_status = str(info.get("current_state") or "").strip() or None
+    log(f"当前服务器状态: {current_status or '未知'}")
+    log(f"状态接口字段: {sorted(p for p, _ in _flatten(info))}")
+
+    if is_server_running(current_status):
+        log(f"✅ 服务器 {safe_id} 状态正常，跳过")
+        return True, current_status or "running", "跳过（状态正常）"
+
+    action_desc = "开机"
+    log("服务器离线/异常，准备开机")
+    gate_ok = ensure_start_gate(sb)
+    started = False
+    if gate_ok:
+        started, msg = api_start_server(sb, identifier)
+        if not started:
+            log(f"Start API 未成功: {msg}", "WARN")
+    if not started:
+        log("=== 浏览器验证流程 ===")
+        passed = browser_verify_flow(sb, identifier, console_url)
+        log(f"浏览器验证{'通过' if passed else '未通过'}")
+        if passed:
+            # 验证通过通常只是发放资格，显式再调一次 Start
+            started, msg = api_start_server(sb, identifier)
+            if not started:
+                log(f"验证后 Start API 未成功: {msg}，改为轮询状态", "WARN")
+        else:
+            # 验证未通过：重新确认资格并再试一次 Start，仍失败则直接返回，不再空等轮询
+            if ensure_start_gate(sb):
+                started, _ = api_start_server(sb, identifier)
+            if not started and not is_server_running(get_server_status(sb, identifier)):
+                reason = "无启动资格" if not gate_ok else "Start API 失败且验证未通过"
+                return False, current_status or "未知", f"{action_desc}失败（{reason}）"
+
+    # ── 轮询状态 ──
+    log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
+    start_poll, last_status = time.time(), None
+    while time.time() - start_poll < 90:
+        try:
+            status = get_server_status(sb, identifier)
+            last_status = status
+            if is_server_running(status):
+                log(f"✅ 服务器 {safe_id} 状态: {status}，{action_desc}成功")
+                return True, status, f"{action_desc}成功"
+            log(f"当前状态: {status or '未知'}，5s 后重试...")
+        except Exception as e:
+            log(f"状态检查异常: {e}", "WARN")
+        time.sleep(5)
+
+    status = get_server_status(sb, identifier) or last_status
+    if is_server_running(status):
+        return True, status, f"{action_desc}成功"
+    log(f"轮询超时，最终状态: {status or '未知'}", "ERROR")
+    return False, status or "未知", f"{action_desc}失败（超时）"
+
+
+# ====================== 账号处理 ======================
+def build_sb(user_data_dir: str):
+    kwargs = dict(uc=True, test=True, locale="en", user_data_dir=user_data_dir,
+                  chromium_arg="--disable-blink-features=AutomationControlled")
+    # uc_gui_click_captcha 依赖真实/虚拟显示，Linux 无 DISPLAY 时用 xvfb
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        kwargs["xvfb"] = True
+    kwargs["headed"] = True
+    return SB(**kwargs)
+
+
+def get_exit_ip() -> str:
+    """获取当前出口 IP（多个服务兜底）。"""
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip"):
+        try:
+            ip = requests.get(url, timeout=8).text.strip()
+            if ip and len(ip) <= 45:
+                return ip
+        except Exception:
+            continue
+    return "未知"
+
+
+def process_account(idx: int, email: str, password: str) -> dict:
+    """处理单个账号，返回结果记录（不再单独推送 TG，由 main 汇总后统一发送）。"""
+    log("=" * 50)
+    log(f"开始处理账号 {idx} | {mask_email(email)}")
+    log("=" * 50)
+
+    rec = {"email": email, "ip": "未知", "ok": True, "error": "", "servers": [], "shots": []}
+    user_data_dir = tempfile.mkdtemp(prefix=f"wisp_usr_{idx}_")
+    try:
+        with build_sb(user_data_dir) as sb:
+            try:
+                logged_in = login(sb, email, password)
+                rec["ip"] = get_exit_ip()  # 登录重试可能切换过 WARP，登录后再取
+                log(f"出口 IP: {rec['ip']}")
+                if not logged_in:
+                    rec.update(ok=False, error="登录失败")
+                    rec["shots"].append(take_screenshot(sb, idx, "login-fail"))
+                    return rec
+
+                servers = get_servers(sb)
+                if not servers:
+                    rec.update(ok=False, error="未找到服务器")
+                    rec["shots"].append(take_screenshot(sb, idx, "no-server"))
+                    return rec
+
+                for si, server_id in enumerate(servers, start=1):
+                    success, final_status, action_desc = restart_server(sb, server_id)
+                    rec["ok"] = rec["ok"] and success
+                    up = None
+                    if is_server_running(final_status):
+                        up = get_uptime_seconds(sb, server_id,
+                                                   CONSOLE_URL_TEMPLATE.format(identifier=server_id))
+                    if up is not None:
+                        uptime_text = fmt_duration(up)
+                    elif is_server_running(final_status):
+                        uptime_text = "未知"
+                    else:
+                        uptime_text = "未运行"
+                    shot = take_screenshot(sb, idx, f"done-{si}" if len(servers) > 1 else "done")
+                    rec["servers"].append({
+                        "id": server_id, "ok": success, "action": action_desc,
+                        "status": status_to_chinese(final_status), "uptime": uptime_text, "shot": shot,
+                    })
+            except Exception as e:
+                log(f"账号 {idx} 处理异常: {e}", "ERROR")
+                rec.update(ok=False, error=f"脚本异常: {str(e)[:150]}")
+                rec["shots"].append(take_screenshot(sb, idx, "exception"))
+                return rec
+    finally:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+    return rec
+
+
+# ====================== Telegram 汇总推送 ======================
+TG_CAPTION_LIMIT = 1024
+TG_TEXT_LIMIT = 4096
+TG_MEDIA_MAX = 10
+
+
+def build_report(records: List[dict], elapsed: float, mask: bool = False, html: bool = False) -> str:
+    """
+    生成运行汇总。
+    mask=True：打码服务器 ID 和 IP（用于公开的 Actions 日志）
+    html=True：使用 Telegram HTML 格式（加粗标题、ID/IP 等宽可点击复制）
+    """
+    from html import escape
+
+    def ipf(ip: str) -> str:
+        if not mask:
+            return ip
+        if ":" in ip:  # IPv6 只保留前两段
+            return ":".join(ip.split(":")[:2]) + ":*"
+        return re.sub(r"\.\d+\.\d+$", ".*.*", ip)
+
+    b = (lambda t: f"<b>{escape(t)}</b>") if html else (lambda t: t)
+    c = (lambda t: f"<code>{escape(t)}</code>") if html else (lambda t: t)
+    e = escape if html else (lambda t: t)
+    sid = mask_server_id if mask else (lambda x: x)
+
+    servers = [x for r in records for x in r["servers"]]
+    skipped = sum(1 for x in servers if x["ok"] and x["action"].startswith("跳过"))
+    started = sum(1 for x in servers if x["ok"] and not x["action"].startswith("跳过"))
+    srv_failed = sum(1 for x in servers if not x["ok"])
+    acc_failed = sum(1 for r in records if not r["ok"])
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+    head_icon = "✅" if acc_failed == 0 and srv_failed == 0 else "⚠️"
+    lines = [
+        f"{head_icon} {b('Wispbyte 运行汇总')}",
+        "",
+        f"🕐 时间：{now}（北京时间）",
+        f"⏱ 耗时：{fmt_duration(elapsed)}",
+        f"👤 账号：{len(records)} 个，成功 {len(records) - acc_failed}，失败 {acc_failed}",
+        f"🖥 服务器：{len(servers)} 台，开机 {started}，跳过 {skipped}，失败 {srv_failed}",
+    ]
+    seen_ips: set = set()
+    for n, r in enumerate(records, start=1):
+        dup = r["ip"] != "未知" and r["ip"] in seen_ips
+        seen_ips.add(r["ip"])
+        lines += [
+            "",
+            "────────────",
+            f"{'✅' if r['ok'] else '❌'} {b('账号' + (chr(64 + n) if n <= 26 else str(n)))}：{c(mask_email(r['email']))}",
+            f"🌐 出口 IP：{c(ipf(r['ip']))}{'（重复）' if dup else ''}",
+        ]
+        if r["error"]:
+            lines.append(f"⚠️ {e(r['error'])}")
+        for x in r["servers"]:
+            lines += [
+                "",
+                f"{'🟢' if x['ok'] else '🔴'} 服务器 {c(sid(x['id']))}",
+                f"      结果：{e(x['action'])}",
+                f"      状态：{e(x['status'])}",
+                f"      运行时长：{e(x['uptime'])}",
+            ]
+    return "\n".join(lines)
+
+
+def _tg_post(token: str, method: str, **kwargs) -> bool:
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=60, **kwargs)
+        if not resp.ok:
+            log(f"Telegram {method} 失败: {resp.status_code} {resp.text[:200]}", "ERROR")
+            return False
+        return True
+    except Exception as e:
+        log(f"Telegram {method} 异常: {e}", "ERROR")
+        return False
+
+
+def send_tg_report(token: str, chat_id: str, records: List[dict], elapsed: float):
+    """整次运行只发一条：截图相册 + 汇总文字作为说明；文字超过 1024 字时改为纯文字消息。"""
+    if not token or not chat_id:
+        return
+    text = build_report(records, elapsed, html=True)
+    plain = build_report(records, elapsed)
+    # 失败截图优先，最多 10 张
+    fail_shots = [x for r in records if not r["ok"] for x in r["shots"]] + \
+                 [s["shot"] for r in records for s in r["servers"] if not s["ok"]]
+    ok_shots = [s["shot"] for r in records for s in r["servers"] if s["ok"]]
+    shots = [p for p in dict.fromkeys(fail_shots + ok_shots) if p and os.path.exists(p)][:TG_MEDIA_MAX]
+
+    if shots and len(plain) <= TG_CAPTION_LIMIT:
+        files, media = {}, []
+        for n, path in enumerate(shots):
+            key = f"p{n}"
+            files[key] = open(path, "rb")
+            item = {"type": "photo", "media": f"attach://{key}"}
+            if n == 0:
+                item["caption"] = text
+                item["parse_mode"] = "HTML"
+            media.append(item)
+        try:
+            if len(media) == 1:
+                ok = _tg_post(token, "sendPhoto", data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
+                              files={"photo": files["p0"]})
+            else:
+                ok = _tg_post(token, "sendMediaGroup",
+                              data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)},
+                              files=files)
+        finally:
+            for f in files.values():
+                f.close()
+        if ok:
+            log("Telegram 汇总通知发送成功（含截图）")
+            return
+    if len(text) <= TG_TEXT_LIMIT:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    else:  # 超长时退回无格式文本截断，避免截断破坏 HTML 标签
+        data = {"chat_id": chat_id, "text": plain[:TG_TEXT_LIMIT], "disable_web_page_preview": True}
+    ok = _tg_post(token, "sendMessage", data=data)
+    if ok:
+        log("Telegram 汇总通知发送成功（纯文字）")
+
+
+# ====================== 账号加载 ======================
+def load_accounts() -> List[Tuple[str, str]]:
+    accounts = []
+    for i in range(1, 6):
+        raw = os.environ.get(f"WISPBYTE_{i}")
+        if not raw:
+            continue
+        parts = raw.split("-----", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            accounts.append((parts[0].strip(), parts[1].strip()))
+            log(f"加载账号 WISPBYTE_{i}: {mask_email(parts[0].strip())}")
+        else:
+            log(f"WISPBYTE_{i} 格式错误，期望 '邮箱-----密码'", "WARN")
+    return accounts
+
+
+def parse_target_emails(raw: str) -> List[str]:
+    if not raw or not raw.strip():
+        return []
+    seen, result = set(), []
+    for part in raw.split(","):
+        email = part.strip().lower()
+        if not email:
+            continue
+        if "@" not in email:
+            log(f"无效的邮箱格式，已跳过: {mask_email(email)}", "WARN")
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        result.append(email)
+    return result
+
+
+# ====================== 入口 ======================
+def main():
+    tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    tg_chat = os.environ.get("TG_CHAT_ID", "").strip()
+    if not tg_token or not tg_chat:
+        log("缺少 TG_BOT_TOKEN 或 TG_CHAT_ID，通知功能将不可用", "WARN")
+
+    all_accounts = load_accounts()
+    if not all_accounts:
+        log("未找到任何有效账号，请检查 Secrets 设置", "ERROR")
+        sys.exit(1)
+
+    target_emails = parse_target_emails(os.environ.get("INPUT_ACCOUNTS", ""))
+    indexed = [(i, e, p) for i, (e, p) in enumerate(all_accounts, start=1)]
+    if target_emails:
+        email_map = {e.lower(): (i, e, p) for i, e, p in indexed}
+        selected = []
+        for t in target_emails:
+            if t in email_map:
+                selected.append(email_map[t])
+            else:
+                log(f"邮箱 '{mask_email(t)}' 未在已配置账号中找到，已跳过", "WARN")
+        if not selected:
+            log("指定的邮箱全部无效，退出", "ERROR")
+            sys.exit(1)
+        log(f"指定运行账号: {[mask_email(e) for _, e, _ in selected]}")
+    else:
+        selected = indexed
+        log("未指定账号，运行全部账号")
+
+    run_start = time.time()
+    records: List[dict] = []
+    for order, (idx, email, password) in enumerate(selected):
+        if order > 0:
+            restart_warp(max_tries=6)
+        try:
+            rec = process_account(idx, email, password)
+        except Exception as e:  # SB 启动失败等，不影响后续账号
+            log(f"账号 {idx} 致命异常: {e}", "ERROR")
+            rec = {"email": email, "ip": get_exit_ip(), "ok": False,
+                   "error": f"致命异常: {str(e)[:150]}", "servers": [], "shots": []}
+        if rec.get("ip") and rec["ip"] != "未知":
+            USED_IPS.add(rec["ip"])
+        records.append(rec)
+        if order < len(selected) - 1:
+            time.sleep(5)
+
+    failed = sum(1 for r in records if not r["ok"])
+    log(f"所有账号处理完毕，失败 {failed}/{len(records)}")
+    report = build_report(records, time.time() - run_start, mask=True)
+    log("运行汇总:\n" + report)
+    send_tg_report(tg_token, tg_chat, records, time.time() - run_start)
+    sys.exit(1 if failed else 0)
+
+if __name__ == "__main__":
+    main()
