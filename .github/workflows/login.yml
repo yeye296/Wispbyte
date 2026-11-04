@@ -1,4 +1,4 @@
-name: Wispbyte 自动重启
+name: Wispbyte 自动保活
 # refer origin: https://github.com/gxjxzgx/Wispbyte
 
 on:
