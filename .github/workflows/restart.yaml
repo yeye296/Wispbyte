@@ -51,7 +51,7 @@ jobs:
           WISPBYTE_5: ${{ secrets.WISPBYTE_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python scripts/main.py
+        run: python scripts/restart.py
 
       - name: Upload Artifacts on Failure
         if: failure()
