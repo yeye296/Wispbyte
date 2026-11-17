@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   restart:
-    name: 执行重启脚本
+    name: 执行保活脚本
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
