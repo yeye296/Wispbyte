@@ -899,7 +899,7 @@ def login(sb, email: str, password: str) -> bool:
             log(f"检测到错误页/空白页（第 {attempt} 次）", "WARN")
         else:
             try:
-                sb.wait_for_element_visible("input#email", timeout=18)
+                sb.wait_for_element_visible("input#login-email", timeout=18)
                 log("✅ 找到登录表单")
                 form_ok = True
                 break
@@ -916,9 +916,9 @@ def login(sb, email: str, password: str) -> bool:
 
     log("填写登录信息...")
     try:
-        sb.type("input#email", email)
+        sb.type("input#login-email", email)
         time.sleep(0.6)
-        sb.type("input#password", password)
+        sb.type("input#login-password", password)
         time.sleep(0.6)
     except Exception as e:
         log(f"填写登录信息失败: {e}", "ERROR")
@@ -930,10 +930,10 @@ def login(sb, email: str, password: str) -> bool:
 
     log("提交登录...")
     try:
-        sb.click("button.login-btn")
+        sb.click("button.auth-submit")
     except Exception:
         try:
-            sb.execute_script('document.querySelector("form#login-form").submit()')
+            sb.execute_script('document.querySelector("button[type=submit]").click()')
         except Exception as e:
             log(f"提交登录失败: {e}", "ERROR")
             return False
